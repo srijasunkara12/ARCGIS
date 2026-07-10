@@ -1,0 +1,11 @@
+ Metric    Your Value   
+ 
+ RMSE      253,829      
+ MAE       161,083      
+ MAPE      9.52 × 10¹⁰  
+ R² Train  0.935        
+ R² Test   0.621       
+ Bias      20,905       
+ NSE       0.621        
+
+

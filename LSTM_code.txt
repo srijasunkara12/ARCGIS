@@ -1,0 +1,662 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score
+)
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+# ============================================================
+# UPLOAD FILES
+# ============================================================
+
+from google.colab import files
+
+print("Upload ALL yearly CSV files together")
+uploaded = files.upload()
+
+# ============================================================
+# READ & MERGE FILES
+# ============================================================
+
+df_list = []
+
+for file_name in uploaded.keys():
+
+    temp = pd.read_csv(file_name)
+
+    # Remove unnamed columns
+    temp = temp.loc[:, ~temp.columns.str.contains('Unnamed')]
+
+    # Convert first column to datetime
+    temp.iloc[:,0] = pd.to_datetime(
+        temp.iloc[:,0],
+        dayfirst=True,
+        errors='coerce'
+    )
+
+    # Drop invalid dates
+    temp = temp.dropna(subset=[temp.columns[0]])
+
+    df_list.append(temp)
+
+# Merge all files
+df = pd.concat(df_list, ignore_index=True)
+
+# Sort chronologically
+df = df.sort_values(df.columns[0]).reset_index(drop=True)
+
+print("\nTotal Combined Records:", len(df))
+
+# ============================================================
+# EXTRACT INPUTS
+# ============================================================
+
+dates = df.iloc[:,0]
+
+# Rainfall columns
+rain_raw = df.iloc[:,1:-1]
+
+# Target inflow column
+flow_data = df.iloc[:,-1].values
+
+# ============================================================
+# CREATE API5 (5-Day Antecedent Rainfall)
+# ============================================================
+
+rain_api5 = rain_raw.rolling(
+    window=5,
+    min_periods=1
+).sum()
+
+rain_api5.columns = [
+    col + "_API5"
+    for col in rain_raw.columns
+]
+
+# Combine original rainfall + API5
+rain_combined = pd.concat(
+    [rain_raw, rain_api5],
+    axis=1
+)
+
+rain_data = rain_combined.values
+
+print("Total Input Features:", rain_data.shape[1])
+
+# ============================================================
+# CREATE LAGGED SEQUENCES
+# ============================================================
+
+lag = 20
+
+X = []
+y = []
+d = []
+
+for i in range(lag, len(df)):
+
+    X.append(rain_data[i-lag:i])
+
+    y.append(flow_data[i])
+
+    d.append(dates.iloc[i])
+
+X = np.array(X)
+y = np.array(y)
+
+d = pd.Series(pd.to_datetime(d))
+
+print("\nLSTM Input Shape:", X.shape)
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+x_scaler = MinMaxScaler()
+y_scaler = MinMaxScaler()
+
+nsamples, timesteps, nfeatures = X.shape
+
+X_scaled = x_scaler.fit_transform(
+    X.reshape(-1, nfeatures)
+).reshape(nsamples, timesteps, nfeatures)
+
+y_scaled = y_scaler.fit_transform(
+    y.reshape(-1,1)
+)
+
+# ============================================================
+# CHRONOLOGICAL TRAIN-TEST SPLIT
+# ============================================================
+
+split = int(len(X_scaled) * 0.8)
+
+X_train = X_scaled[:split]
+X_test  = X_scaled[split:]
+
+y_train = y_scaled[:split]
+y_test  = y_scaled[split:]
+
+d_train = d.iloc[:split].reset_index(drop=True)
+d_test  = d.iloc[split:].reset_index(drop=True)
+
+print("\nTraining Samples :", len(X_train))
+print("Testing Samples  :", len(X_test))
+
+# ============================================================
+# BUILD LSTM MODEL
+# ============================================================
+
+model = Sequential([
+
+    LSTM(
+        64,
+        return_sequences=True,
+        input_shape=(lag, nfeatures)
+    ),
+
+    Dropout(0.2),
+
+    LSTM(32),
+
+    Dropout(0.2),
+
+    Dense(1)
+
+])
+
+model.compile(
+    optimizer='adam',
+    loss='mse'
+)
+
+model.summary()
+
+# ============================================================
+# TRAIN MODEL
+# ============================================================
+
+history = model.fit(
+
+    X_train,
+    y_train,
+
+    epochs=60,
+    batch_size=32,
+
+    validation_split=0.2,
+
+    verbose=1
+)
+
+# ============================================================
+# PREDICTIONS
+# ============================================================
+
+# All data prediction
+y_all_pred = model.predict(X_scaled)
+
+# Train prediction
+y_train_pred = model.predict(X_train)
+
+# Test prediction
+y_test_pred = model.predict(X_test)
+
+# ============================================================
+# INVERSE TRANSFORM
+# ============================================================
+
+y_all_actual = y_scaler.inverse_transform(y_scaled)
+y_all_pred_actual = y_scaler.inverse_transform(y_all_pred)
+
+y_train_actual = y_scaler.inverse_transform(y_train)
+y_train_pred_actual = y_scaler.inverse_transform(y_train_pred)
+
+y_test_actual = y_scaler.inverse_transform(y_test)
+y_test_pred_actual = y_scaler.inverse_transform(y_test_pred)
+
+# ============================================================
+# PERFORMANCE METRICS
+# ============================================================
+
+# RMSE
+rmse = np.sqrt(
+    mean_squared_error(
+        y_test_actual,
+        y_test_pred_actual
+    )
+)
+
+# MAE
+mae = mean_absolute_error(
+    y_test_actual,
+    y_test_pred_actual
+)
+
+# MAPE
+mape = np.mean(
+    np.abs(
+        (y_test_actual - y_test_pred_actual)
+        /
+        (y_test_actual + 1e-6)
+    )
+) * 100
+
+# R²
+r2_train = r2_score(
+    y_train_actual,
+    y_train_pred_actual
+)
+
+r2_test = r2_score(
+    y_test_actual,
+    y_test_pred_actual
+)
+
+# Bias
+bias = np.mean(
+    y_test_pred_actual - y_test_actual
+)
+
+# NSE
+nse = 1 - (
+    np.sum(
+        (y_test_actual - y_test_pred_actual)**2
+    )
+    /
+    np.sum(
+        (y_test_actual - np.mean(y_test_actual))**2
+    )
+)
+
+# ============================================================
+# PRINT METRICS
+# ============================================================
+
+print("\n==============================")
+print("MODEL PERFORMANCE")
+print("==============================")
+
+print("RMSE        :", rmse)
+print("MAE         :", mae)
+print("MAPE (%)    :", mape)
+
+print("R² Train    :", r2_train)
+print("R² Test     :", r2_test)
+
+print("Bias        :", bias)
+print("NSE         :", nse)
+
+# ============================================================
+# CONVERGENCE PLOT
+# ============================================================
+
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    history.history['loss'],
+    label='Training Loss'
+)
+
+plt.plot(
+    history.history['val_loss'],
+    label='Validation Loss'
+)
+
+plt.title("Model Convergence")
+
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+
+plt.legend()
+
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# MONSOON FILTER
+# ============================================================
+
+monsoon_months = [6,7,8,9]
+
+mask_all = d.dt.month.isin(monsoon_months)
+
+mask_test = d_test.dt.month.isin(monsoon_months)
+
+d_monsoon = d.loc[mask_all]
+
+y_all_actual_monsoon = y_all_actual[mask_all]
+y_all_pred_monsoon = y_all_pred_actual[mask_all]
+
+d_test_monsoon = d_test.loc[mask_test]
+
+y_test_actual_monsoon = y_test_actual[mask_test]
+y_test_pred_monsoon = y_test_pred_actual[mask_test]
+
+# ============================================================
+# MONSOON PEAK FLOW ANALYSIS
+# ============================================================
+
+y_obs = y_all_actual_monsoon.flatten()
+y_pred = y_all_pred_monsoon.flatten()
+
+peak_obs = np.max(y_obs)
+peak_pred = np.max(y_pred)
+
+idx_obs = np.argmax(y_obs)
+idx_pred = np.argmax(y_pred)
+
+date_obs_peak = d_monsoon.iloc[idx_obs]
+date_pred_peak = d_monsoon.iloc[idx_pred]
+
+peak_error = abs(
+    peak_obs - peak_pred
+) / peak_obs * 100
+
+print("\n==============================")
+print("MONSOON PEAK FLOW ANALYSIS")
+print("==============================")
+
+print(
+    "Observed Peak :",
+    peak_obs,
+    "on",
+    date_obs_peak.date()
+)
+
+print(
+    "Predicted Peak:",
+    peak_pred,
+    "on",
+    date_pred_peak.date()
+)
+
+print(
+    "Peak Error (%):",
+    peak_error
+)
+
+# ============================================================
+# MONSOON SIMULATION PLOT
+# ============================================================
+
+x_all = np.arange(len(d_monsoon))
+
+plt.figure(figsize=(16,6))
+
+plt.plot(
+    x_all,
+    y_all_actual_monsoon,
+    label="Observed"
+)
+
+plt.plot(
+    x_all,
+    y_all_pred_monsoon,
+    label="Predicted"
+)
+
+plt.title("Monsoon Simulation (June–September)")
+
+plt.ylabel("Inflow (Cusecs)")
+
+step = max(len(x_all)//15,1)
+
+plt.xticks(
+
+    x_all[::step],
+
+    d_monsoon.dt.strftime('%d-%m-%Y')[::step],
+
+    rotation=45
+)
+
+plt.legend()
+
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# VALIDATION PEAK ANALYSIS
+# ============================================================
+
+obs_peak_v = float(
+    np.nanmax(y_test_actual_monsoon)
+)
+
+obs_idx_v = np.nanargmax(
+    y_test_actual_monsoon
+)
+
+obs_date_v = d_test_monsoon.iloc[obs_idx_v]
+
+pred_on_obs_day_v = float(
+    y_test_pred_monsoon[obs_idx_v]
+)
+
+pred_peak_v = float(
+    np.nanmax(y_test_pred_monsoon)
+)
+
+pred_idx_v = np.nanargmax(
+    y_test_pred_monsoon
+)
+
+pred_date_v = d_test_monsoon.iloc[pred_idx_v]
+
+peak_error_v = abs(
+    obs_peak_v - pred_peak_v
+) / obs_peak_v * 100
+
+print("\n==============================")
+print("VALIDATION PEAK FLOW")
+print("==============================")
+
+print(
+    "Observed Peak:",
+    obs_peak_v,
+    "on",
+    obs_date_v.date()
+)
+
+print(
+    "Predicted Peak:",
+    pred_peak_v,
+    "on",
+    pred_date_v.date()
+)
+
+print(
+    "Peak Error (%):",
+    peak_error_v
+)
+
+# ============================================================
+# VALIDATION PLOT
+# ============================================================
+
+x_test = np.arange(len(d_test_monsoon))
+
+plt.figure(figsize=(16,6))
+
+plt.plot(
+    x_test,
+    y_test_actual_monsoon,
+    label="Observed Test"
+)
+
+plt.plot(
+    x_test,
+    y_test_pred_monsoon,
+    label="Predicted Test"
+)
+
+plt.title("Validation During Monsoon (Test)")
+
+plt.ylabel("Inflow (Cusecs)")
+
+step = max(len(x_test)//15,1)
+
+plt.xticks(
+
+    x_test[::step],
+
+    d_test_monsoon.dt.strftime('%d-%m-%Y')[::step],
+
+    rotation=45
+)
+
+plt.legend()
+
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# SCATTER PLOT
+# ============================================================
+
+plt.figure(figsize=(7,7))
+
+plt.scatter(
+    y_test_actual,
+    y_test_pred_actual,
+    alpha=0.6
+)
+
+min_val = min(
+    y_test_actual.min(),
+    y_test_pred_actual.min()
+)
+
+max_val = max(
+    y_test_actual.max(),
+    y_test_pred_actual.max()
+)
+
+plt.plot(
+    [min_val, max_val],
+    [min_val, max_val],
+    'r--'
+)
+
+plt.xlabel("Observed Flow")
+
+plt.ylabel("Predicted Flow")
+
+plt.title("Observed vs Predicted")
+
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# ERROR ANALYSIS
+# ============================================================
+
+errors = (
+    y_test_actual.flatten()
+    -
+    y_test_pred_actual.flatten()
+)
+
+# Residual Plot
+plt.figure(figsize=(10,5))
+
+plt.plot(errors)
+
+plt.axhline(
+    y=0,
+    color='r',
+    linestyle='--'
+)
+
+plt.title("Residual Errors")
+
+plt.xlabel("Sample")
+
+plt.ylabel("Error")
+
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# ERROR DISTRIBUTION
+# ============================================================
+
+plt.figure(figsize=(8,5))
+
+plt.hist(
+    errors,
+    bins=30
+)
+
+plt.title("Error Distribution")
+
+plt.xlabel("Prediction Error")
+
+plt.ylabel("Frequency")
+
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# PERFORMANCE SUMMARY TABLE
+# ============================================================
+
+performance = pd.DataFrame({
+
+    "Metric": [
+
+        "RMSE",
+        "MAE",
+        "MAPE",
+        "R² Train",
+        "R² Test",
+        "Bias",
+        "NSE"
+
+    ],
+
+    "Value": [
+
+        rmse,
+        mae,
+        mape,
+        r2_train,
+        r2_test,
+        bias,
+        nse
+    ]
+})
+
+print("\n==============================")
+print("FINAL PERFORMANCE SUMMARY")
+print("==============================")
+
+print(performance)
+
+# ============================================================
+# SAVE MODEL
+# ============================================================
+
+model.save("Hydrology_LSTM_Model.h5")
+
+print("\nModel Saved Successfully")
